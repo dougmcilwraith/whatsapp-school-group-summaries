@@ -1,0 +1,13 @@
+{
+  "model": "gemini-2.5-flash",
+  "groups": {
+    "Example Group A": "GRA",
+    "Example Group B": "GRB"
+  },
+  "db_path": "~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite",
+  "recipient_emails": [
+    "you@example.com"
+  ],
+  "smtp_host": "smtp.gmail.com",
+  "smtp_port": 587
+}
