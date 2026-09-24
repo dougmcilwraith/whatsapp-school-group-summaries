@@ -70,7 +70,13 @@ def fetch_group_messages(db_path: Path, snapshot_path: Path, name_query: str, da
     return groups
 
 
-def summarise_with_gemini(chat_name: str, by_day: dict[str, list[tuple[float, str, str]]], model: str) -> dict[str, list[str]]:
+def summarise_with_gemini(chat_name: str, by_day: dict[str, list[tuple[float, str, str]]], model: str) -> dict[str, list[dict]]:
+    """Returns {sent_date: [{"event_date": "YYYY-MM-DD" | None, "text": str}, ...]}.
+
+    event_date is the actual date the action point applies to, resolved from relative
+    references ("today", "tomorrow", "next Friday") using the message's own send date
+    as the reference point - NOT the date this script happens to run.
+    """
     from google import genai
     from google.genai import types
 
@@ -86,11 +92,18 @@ def summarise_with_gemini(chat_name: str, by_day: dict[str, list[tuple[float, st
     days = sorted(by_day)
     prompt = (
         f"Below is a transcript of messages from the WhatsApp group \"{chat_name}\", "
-        f"split into sections per day (--- YYYY-MM-DD ---). Each line is prefixed with the sender's name.\n\n"
+        f"split into sections per day (--- YYYY-MM-DD ---, this is the date the messages in that "
+        f"section were SENT). Each line is prefixed with the sender's name.\n\n"
         f"For each day, extract concrete action points and reminders (e.g. things parents/members "
         f"need to bring, do, remember, or dates/deadlines mentioned). Ignore small talk. "
+        f"For each action point, also resolve the date it actually applies to (event_date), as a "
+        f"YYYY-MM-DD string. Resolve relative references like \"today\", \"tomorrow\", \"this Friday\", "
+        f"or \"the 26th\" using the section's own send date (--- YYYY-MM-DD ---) as the reference "
+        f"point, NOT today's real-world date. If the action point has no specific date or deadline, "
+        f"set event_date to null. "
         f"If a day has no action points, return an empty list for it. "
-        f"Respond ONLY with a JSON object mapping each date (YYYY-MM-DD) to a list of short action point strings. "
+        f"Respond ONLY with a JSON object mapping each send date (YYYY-MM-DD) to a list of objects "
+        f"with keys \"event_date\" and \"text\". "
         f"Days: {', '.join(days)}\n\n"
         f"Transcript:\n{transcript}"
     )
@@ -108,9 +121,29 @@ def make_abbreviation(chat_name: str) -> str:
     return "".join(w[0] for w in words[:3]).upper()
 
 
-def merge_group_results(group_results: list[tuple[str, str, dict[str, list[str]], dict[str, int]]]):
-    """Merges per-group action points keyed by day, resolving each group's display abbreviation."""
-    points_by_day: dict[str, list[tuple[str, str]]] = defaultdict(list)
+def dedupe_similar_rows(rows: list[tuple[str, str, str]], similarity_threshold: float = 0.7) -> list[tuple[str, str, str]]:
+    """Drops rows whose text overlaps heavily with an earlier row sharing the same (label, abbr) key."""
+    from difflib import SequenceMatcher
+
+    kept: list[tuple[str, str, str]] = []
+    for label, abbr, text in rows:
+        is_duplicate = any(
+            label == kept_label and abbr == kept_abbr
+            and SequenceMatcher(None, text.lower(), kept_text.lower()).ratio() >= similarity_threshold
+            for kept_label, kept_abbr, kept_text in kept
+        )
+        if not is_duplicate:
+            kept.append((label, abbr, text))
+    return kept
+
+
+def merge_group_results(group_results: list[tuple[str, str, dict[str, list[dict]], dict[str, int]]]):
+    """Merges per-group action points keyed by send date, resolving each group's display abbreviation.
+
+    Each point is (abbr, event_date, text), where event_date is the resolved date the point
+    applies to (falling back to the send date if Gemini couldn't resolve one).
+    """
+    points_by_day: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
     total_counts: dict[str, int] = defaultdict(int)
     legend: dict[str, str] = {}
 
@@ -118,36 +151,41 @@ def merge_group_results(group_results: list[tuple[str, str, dict[str, list[str]]
         abbr = config.GROUP_ABBREVIATIONS.get(name_query) or make_abbreviation(chat_name)
         legend[abbr] = chat_name
         total_counts[abbr] += sum(message_counts.values())
-        for day, points in action_points.items():
-            points_by_day[day]  # ensure the day shows up even with no action points
+        for sent_date, points in action_points.items():
+            points_by_day[sent_date]  # ensure the day shows up even with no action points
             for point in points:
-                points_by_day[day].append((abbr, point))
+                event_date = point.get("event_date") or sent_date
+                points_by_day[sent_date].append((abbr, event_date, point["text"]))
 
     return points_by_day, total_counts, legend
 
 
-def build_combined_report(group_results: list[tuple[str, str, dict[str, list[str]], dict[str, int]]]) -> str:
+def build_combined_report(group_results: list[tuple[str, str, dict[str, list[dict]], dict[str, int]]]) -> str:
     """Merges per-group action points into one compact table, newest day first, tagged by group abbreviation."""
     points_by_day, total_counts, legend = merge_group_results(group_results)
 
     lines = ["Key: " + ", ".join(f"{abbr}={name}" for abbr, name in legend.items()), ""]
-    lines.append(f"{'Date':<6}{'Grp':<5}Action point")
+    lines.append(f"{'Date':<6}{'Target':<7}{'Grp':<5}Action point")
     for day in sorted(points_by_day, reverse=True):
         short_day = day[5:]  # MM-DD, year omitted for brevity
         points = points_by_day[day]
         if not points:
-            lines.append(f"{short_day:<6}{'':<5}(no action points)")
+            lines.append(f"{short_day:<6}{'':<7}{'':<5}(no action points)")
             continue
-        for abbr, point in points:
-            lines.append(f"{short_day:<6}{abbr:<5}{point}")
+        for abbr, event_date, point in points:
+            short_target = event_date[5:] if event_date != day else "-"
+            lines.append(f"{short_day:<6}{short_target:<7}{abbr:<5}{point}")
 
     lines.append("")
     lines.append("Messages this period: " + ", ".join(f"{abbr} {count}" for abbr, count in total_counts.items()))
     return "\n".join(lines)
 
 
-def build_html_report(group_results: list[tuple[str, str, dict[str, list[str]], dict[str, int]]]) -> str:
-    """HTML version with real <table> markup (so it doesn't wrap awkwardly) and a today/tomorrow highlight."""
+def build_html_report(group_results: list[tuple[str, str, dict[str, list[dict]], dict[str, int]]]) -> str:
+    """HTML version with real <table> markup (so it doesn't wrap awkwardly) and a today/tomorrow highlight.
+
+    Highlighting is based on each point's resolved event_date, not the date the message was sent.
+    """
     import datetime
     from html import escape
 
@@ -155,7 +193,6 @@ def build_html_report(group_results: list[tuple[str, str, dict[str, list[str]], 
 
     today = datetime.date.today().isoformat()
     tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
-    highlight_days = [("Today", today), ("Tomorrow", tomorrow)]
 
     parts = [
         "<html><body style='font-family: sans-serif; font-size: 14px;'>",
@@ -163,10 +200,12 @@ def build_html_report(group_results: list[tuple[str, str, dict[str, list[str]], 
     ]
 
     highlight_rows = [
-        (label, abbr, point)
-        for label, day in highlight_days
-        for abbr, point in points_by_day.get(day, [])
+        ("Today" if event_date == today else "Tomorrow", abbr, point)
+        for day in points_by_day
+        for abbr, event_date, point in points_by_day[day]
+        if event_date in (today, tomorrow)
     ]
+    highlight_rows = dedupe_similar_rows(highlight_rows)
     if highlight_rows:
         parts.append("<h3 style='color:#c0392b;'>Happening today / tomorrow</h3>")
         parts.append("<table cellpadding='6' cellspacing='0' style='border-collapse:collapse;border:1px solid #ccc;'>")
@@ -179,15 +218,18 @@ def build_html_report(group_results: list[tuple[str, str, dict[str, list[str]], 
 
     parts.append("<h3>All action points</h3>")
     parts.append("<table cellpadding='6' cellspacing='0' style='border-collapse:collapse;border:1px solid #ccc;'>")
-    parts.append("<tr><th align='left'>Date</th><th align='left'>Grp</th><th align='left'>Action point</th></tr>")
+    parts.append("<tr><th align='left'>Date sent</th><th align='left'>Target date</th><th align='left'>Grp</th><th align='left'>Action point</th></tr>")
     for day in sorted(points_by_day, reverse=True):
-        row_style = " style='background:#fdebd0;'" if day in (today, tomorrow) else ""
         points = points_by_day[day]
         if not points:
-            parts.append(f"<tr{row_style}><td>{day}</td><td></td><td><i>(no action points)</i></td></tr>")
+            parts.append(f"<tr><td>{day}</td><td>-</td><td></td><td><i>(no action points)</i></td></tr>")
             continue
-        for abbr, point in points:
-            parts.append(f"<tr{row_style}><td>{day}</td><td>{escape(abbr)}</td><td>{escape(point)}</td></tr>")
+        for abbr, event_date, point in points:
+            row_style = " style='background:#fdebd0;'" if event_date in (today, tomorrow) else ""
+            target = event_date if event_date != day else "-"
+            parts.append(
+                f"<tr{row_style}><td>{day}</td><td>{escape(target)}</td><td>{escape(abbr)}</td><td>{escape(point)}</td></tr>"
+            )
     parts.append("</table>")
 
     parts.append(
